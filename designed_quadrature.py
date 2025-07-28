@@ -109,13 +109,13 @@ def quad_int_mul_u_sens(a, b, use_gaussian=True):
     b : ndarray
         Points at which to evaluate (n_s x d array)
     use_gaussian : bool
-        If True, use Hermite polynomials (Gaussian)
-        If False, use Jacobi polynomials (uniform)
+        If True, use monomials for Gaussian quadrature
+        If False, use monomials for uniform quadrature
         
     Returns:
     --------
     c : ndarray
-        Product of polynomials evaluated at points
+        Product of monomials evaluated at points
     cdm : ndarray
         Derivatives with respect to each dimension
     """
@@ -123,24 +123,15 @@ def quad_int_mul_u_sens(a, b, use_gaussian=True):
     cmatrix = []
     cdmatrix = []
     
-    # Evaluate polynomials for each dimension
+    # Evaluate monomials for each dimension
     for i in range(d):
         xi = b[:, i]
-        if use_gaussian:
-            # Hermite polynomial and its derivative
-            c_i = eval_hermite(a[i], xi)
-            if a[i] > 0:
-                cd_i = a[i] * eval_hermite(a[i]-1, xi)
-            else:
-                cd_i = np.zeros_like(xi)
+        # Use monomials x^a[i]
+        c_i = xi**a[i]
+        if a[i] > 0:
+            cd_i = a[i] * xi**(a[i]-1)
         else:
-            # Legendre polynomial (Jacobi with α=β=0) and its derivative
-            c_i = eval_jacobi(a[i], 0, 0, xi)
-            if a[i] > 0:
-                # Derivative of Legendre polynomial
-                cd_i = (a[i]/2) * eval_jacobi(a[i]-1, 1, 1, xi)
-            else:
-                cd_i = np.zeros_like(xi)
+            cd_i = np.zeros_like(xi)
         cmatrix.append(c_i)
         cdmatrix.append(cd_i)
     
@@ -164,6 +155,71 @@ def quad_int_mul_u_sens(a, b, use_gaussian=True):
         cdm[:, r] = cd
     
     return c, cdm
+
+
+def gaussian_moment(a):
+    """
+    Compute the exact integral of x^a with standard normal distribution.
+    
+    For multivariate Gaussian N(0,I), the integral of x1^a1 * x2^a2 * ... * xd^ad
+    equals the product of univariate integrals.
+    
+    For univariate standard normal:
+    - If a is odd: integral = 0
+    - If a is even (a = 2k): integral = (2k-1)!! = 1*3*5*...*(2k-1)
+    
+    Parameters:
+    -----------
+    a : ndarray
+        Multi-index of polynomial degrees
+        
+    Returns:
+    --------
+    moment : float
+        The exact integral value
+    """
+    moment = 1.0
+    for ai in a:
+        if ai % 2 == 1:  # Odd power
+            return 0.0
+        else:  # Even power
+            k = ai // 2
+            # Compute (2k-1)!! = 1*3*5*...*(2k-1)
+            double_factorial = 1.0
+            for j in range(1, k + 1):
+                double_factorial *= (2*j - 1)
+            moment *= double_factorial
+    return moment
+
+
+def uniform_moment(a):
+    """
+    Compute the exact integral of x^a over [-1,1]^d with uniform measure.
+    
+    For uniform distribution on [-1,1]:
+    - If a is odd: integral = 0
+    - If a is even: integral = 2/(a+1)
+    
+    Parameters:
+    -----------
+    a : ndarray
+        Multi-index of polynomial degrees
+        
+    Returns:
+    --------
+    moment : float
+        The exact integral value
+    """
+    # For uniform on [-1,1]^d with density 1/2^d
+    moment = 1.0
+    for ai in a:
+        if ai % 2 == 1:  # Odd power
+            return 0.0
+        else:  # Even power
+            moment *= 2.0 / (ai + 1)
+    # Account for the density 1/2^d
+    moment /= 2**len(a)
+    return moment
 
 
 def cons_computation(b, parm, use_gaussian=True):
@@ -417,9 +473,13 @@ def _designed_quadrature_single_attempt(d, p, n_s, use_total_degree=True, use_ga
     xnew.extend(w)
     xnew = np.array(xnew)
     
-    # Right hand side
+    # Right hand side - set target moments for each polynomial
     RHS = np.zeros(n_terms + n_s * (d + 1))
-    RHS[0] = 1  # First polynomial (constant) should integrate to 1
+    for i in range(n_terms):
+        if use_gaussian:
+            RHS[i] = gaussian_moment(aind[i])
+        else:
+            RHS[i] = uniform_moment(aind[i])
     
     delta = 1
     iters = []
@@ -450,12 +510,15 @@ def _designed_quadrature_single_attempt(d, p, n_s, use_total_degree=True, use_ga
             J[i, d*n_s:(d+1)*n_s] = Ri
         
         # Compute constraint residuals and Jacobians
-        # In MATLAB: parm = 1/norm(R-[1;zeros(n_terms-1,1)])
-        # This is used for scaling the regularization, not as the actual target
+        # Compute target moments for regularization scaling
         parm_target = np.zeros(n_terms)
-        parm_target[0] = 1.0  # Constant term should integrate to 1
+        for i in range(n_terms):
+            if use_gaussian:
+                parm_target[i] = gaussian_moment(aind[i])
+            else:
+                parm_target[i] = uniform_moment(aind[i])
         parm = 1 / np.linalg.norm(R - parm_target)
-        parm = max(parm, 1000)  # Increased back to enforce constraints more strongly
+        parm = max(parm, 1000)  # Increased to enforce constraints more strongly
         
         Rcons = []
         Jcons = []
@@ -506,10 +569,8 @@ def _designed_quadrature_single_attempt(d, p, n_s, use_total_degree=True, use_ga
         if delta / ndecr > 10000:
             if verbose:
                 print(f"Newton decrement too small: {ndecr/delta:.6e}. Increase number of points.")
-                print(f"R[0] = {R[0]:.6e}, target = 1.0")
-                target_actual = np.zeros(n_terms)
-                target_actual[0] = 1
-                print(f"R norm without constraints = {np.linalg.norm(R - target_actual):.6e}")
+                print(f"R[0] = {R[0]:.6e}, target = {parm_target[0]:.6e}")
+                print(f"R norm without constraints = {np.linalg.norm(R - parm_target):.6e}")
             break
         
         if delta > 1e30:
@@ -527,13 +588,7 @@ def _designed_quadrature_single_attempt(d, p, n_s, use_total_degree=True, use_ga
         b[:, i] = xnew[i*n_s:(i+1)*n_s]
     w = xnew[d*n_s:(d+1)*n_s]
     
-    # Drop mapping - keep support on [-1,1] for uniform case
-    
-    # Scale nodes for standard Gaussian
-    if use_gaussian:
-        # Hermite polynomials are orthogonal w.r.t exp(-x²)
-        # For standard Gaussian exp(-x²/2)/√(2π), scale nodes by √2
-        b = b * np.sqrt(2)
+    # No scaling needed - we're already working with the correct measure
     
     # Check for negative weights
     n_neg = 0
